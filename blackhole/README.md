@@ -2,7 +2,8 @@
 
 ## Demo
 
-**[Live demo](https://korslund.github.io/demos/blackhole)**
+[![Live demo](thumb.png)](https://korslund.github.io/demos/blackhole)
+[Live demo](https://korslund.github.io/demos/blackhole)
 
 ## Features
 
@@ -18,48 +19,36 @@
 ## Screenshots
 
 | | |
-|---|---|
 | ![](disk.png) | ![](lensing.png) |
 | ![](grid.png) | ![](reverse.png) |
 
-## Physics
+## Physics and rendering
 
 - **Geometry:** largely follows a 2020 paper by Eric Bruneton [1]. Since
   non-rotating black holes are always perfect spheres, all paths can be reduced
   to a function of just two variables. That function can then be precomputed at
   startup (sampled non-linearly to remain well resolved at critical points [2])
   and stored in a 2D texture, making runtime lookup extremely cheap.
-
 - **Stars:** forward-mapped star sprites [3] means a single star can appear up
   to 4 times around the black hole, each at the correct location and
   magnification and with no smearing.
-
 - **Accretion disk:** a thin Keplerian disk, Doppler-shifted so the approaching
   (left) side is bluer and brighter while the other side is redshifted. [4] [5]
-
-## Rendering
-
-- Procedural Milky Way baked into a cubemap, so the sky costs practically
-  nothing.
-
-- Colors: blackbody color table ([6]), bloom/glare ([7],[8]). Claude also
-  really likes to put ACES tonemaps into everything [9].
+- Procedural background galaxy baked into a static cubemap skybox.
+- Blackbody color table [6]. Bloom/glare [7],[8]. ACES tonemaps [9].
 
 ## Limitations
 
 - Designed as a stand-alone renderer. Putting this into a larger Space Engine
   style universe simulation is possible but will require some extra work.
-
 - The accretion disk texture isn't very fancy or plausible, and the background
   stars/galaxy are just placeholders.
-
 - A rotating (Kerr) black hole would more realistic, but that breaks the
   symmetry and requires changes to the main algorithm.
 
 ## Credits
 
 Physics and code by Opus 5.5
-
 Ideas and testing by Nicolay Korslund
 
 ## References
