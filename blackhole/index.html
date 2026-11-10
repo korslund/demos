@@ -1,0 +1,1603 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black hole: real-time Schwarzschild lensing</title>
+<meta name="description" content="A fast and physically accurate black hole rendered in WebGL2.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Black hole: real-time Schwarzschild lensing">
+<meta property="og:description" content="Exact lensing from precomputed geodesic tables, a relativistic accretion disk, the photon ring and lensed stars, in real time in the browser.">
+<meta property="og:image" content="thumb.png">
+<meta property="og:url" content="https://korslund.github.io/demos/blackhole/">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  #info { position: fixed; left: 8px; top: 8px; color: #bbb; font: 12px monospace;
+          pointer-events: none; white-space: pre; text-shadow: 0 0 3px #000; }
+  @media (max-width: 600px) { #info { top: auto; bottom: 8px; } }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"></div>
+<script src="../vendor/lil-gui-0.19.2.umd.min.js"></script>
+<script src="tour.js"></script>
+<script>
+'use strict';
+const REPO_URL = 'https://github.com/korslund/demos/blackhole';
+// Schwarzschild black hole via precomputed geodesic tables.
+// - Camera-independent ("universal") tables: one table of orbits indexed by impact parameter, built
+//   once; per camera distance only a cheap 1D root find plus a GPU pass.
+// - Star occlusion read from the scene pass's alpha (per-pixel disk transmittance) in the blend stage.
+// - The Milky Way baked once into a mipmapped cubemap, sampled with the escape direction's derivatives.
+// - Anti-aliasing of the photon ring by adaptive supersampling in theta only (see "Ring AA" below).
+// - Glare (eye PSF of Spencer et al. 1995) as an energy-conserving mip-chain convolution before the
+//   tonemap.
+// Units: G = c = M = 1. Horizon r=2, photon sphere r=3, ISCO r=6, b_c = 3*sqrt(3).
+//
+// Every ray lives in the plane (hole, camera, ray dir). In that plane u=1/r obeys the Binet
+// equation u'' = 3u^2 - u with the in-plane angle phi as the independent variable, and the only
+// free parameter is theta = angle between the ray and the direction to the hole. So:
+//   END[theta]      : phi where the ray escapes (u=0) or hits the horizon (u=1/2)   (1D)
+//   U[theta, phi]   : u along the ray, used for disk crossings at phi0 + k*pi       (2D)
+//   INV[Phi]        : inverse of END on the escaping branch, for forward-mapped stars (1D)
+// These camera tables depend only on camera distance R; orientation and orbit position are free.
+// They are derived from the universal tables (see below) instead of integrated per R.
+
+const PI = Math.PI;
+
+// ============================================================ core (portable, no GL)
+const NH = 512, NTH = 2 * NH;            // theta rows: [0,NH) captured, [NH,NTH) escaping
+const NPHI = 512, PHIMAX = 4 * PI, DPHI = PHIMAX / (NPHI - 1);
+const NINV = 1024, PHIINV = 4 * PI, DPHIINV = PHIINV / (NINV - 1);
+const EPS = 1e-6, LOG_EPS = Math.log(EPS);
+
+function critTheta(R) {
+  const s = Math.min(3 * Math.sqrt(3) * Math.sqrt(1 - 2 / R) / R, 1);
+  return R >= 3 ? Math.asin(s) : PI - Math.asin(s);
+}
+
+// Row i -> theta. Each half is log-spaced in |theta - theta_c|, where deflection ~ -log.
+function rowTheta(i, thc) {
+  if (i < NH) {
+    const t = i / (NH - 1), lt = Math.log(thc);
+    return thc - Math.exp(lt + t * (LOG_EPS - lt));
+  }
+  const t = (i - NH) / (NH - 1);
+  return thc + Math.exp(LOG_EPS + t * (Math.log(PI - thc) - LOG_EPS));
+}
+
+// Inverse of END on the escaping branch, for forward-mapped stars. X[i] = log|theta_i - theta_c|.
+function buildInv(END, X) {
+  // END decreases from (large) at i=NH to ~0 at i=NTH-1.
+  let nonMono = 0;
+  for (let i = NH + 1; i < NTH; i++) if (END[i] > END[i - 1]) nonMono++;
+  const INV = new Float32Array(NINV);
+  let invMax = 0, i = NTH - 1;
+  for (let j = 0; j < NINV; j++) {
+    const P = j * DPHIINV;
+    while (i - 1 >= NH && END[i - 1] < P) i--;
+    if (i - 1 < NH) { INV[j] = X[NH]; continue; }
+    if (P <= END[i]) { INV[j] = X[i]; invMax = P; continue; }
+    const f = (P - END[i]) / (END[i - 1] - END[i]);
+    INV[j] = X[i] + f * (X[i - 1] - X[i]);
+    invMax = P;
+  }
+  return { INV, invMax, nonMono };
+}
+
+// ============================================================ universal (camera-independent) tables
+// A ray's orbit depends only on its impact parameter b, so one table of orbits covers every camera.
+// Rows: b, log-spaced in |b - b_c| on each side of b_c (NB rows per side).
+//   side 0 (b < b_c): no turning point. The orbit runs from infinity (u = 0) to the horizon (u = 1/2).
+//   side 1 (b > b_c): the inbound leg from infinity to the periapsis u_p; the outbound leg is its mirror.
+// Columns: sigma = psi / PHI(b), with psi the angle swept from infinity and PHI the angle to the
+// horizon (side 0) or to the periapsis (side 1). Stored (RG): side 0: u; side 1: q = sqrt(1 - u/u_p),
+// which is linear in psi at the periapsis; plus d/dsigma of it, for Hermite interpolation along sigma.
+// Across rows: Catmull-Rom in log|b - b_c|.
+// A camera at u_c sits on each orbit where u = u_c (psi = D). Per distance, buildCam() finds D for
+// every theta row (a 1D root find, no integration), and a GPU pass renders the camera table
+// U(theta, phi) from the universal one. The scene shaders are unchanged.
+const BC = 3 * Math.sqrt(3);
+const NB = 1024, NU = 2 * NB, NS = 512;
+const LDB0 = Math.log(1e-9), LDB_P = Math.log(BC), BMAX = 1e4, LDB_T = Math.log(BMAX - BC);
+const H_INT = 2e-3, TRMAX = 1 << 14;
+const TR_U = new Float64Array(TRMAX), TR_V = new Float64Array(TRMAX);
+const clampv = (x, a, b) => x < a ? a : x > b ? b : x;
+
+// Universal row k -> signed b - b_c. Row 0 of each side is nearest b_c.
+function uniDb(k) {
+  if (k < NB) return -Math.exp(LDB0 + k / (NB - 1) * (LDB_P - LDB0));
+  return Math.exp(LDB0 + (k - NB) / (NB - 1) * (LDB_T - LDB0));
+}
+// Signed b - b_c -> continuous row coordinate within its side (unclamped; < 0 is closer to b_c than row 0).
+function uniRowCoord(db) {
+  return db < 0 ? (Math.log(-db) - LDB0) / (LDB_P - LDB0) * (NB - 1)
+                : (Math.log(db) - LDB0) / (LDB_T - LDB0) * (NB - 1);
+}
+
+// Periapsis u_p of a side-1 orbit: the root of u^2 (1 - 2u) = 1/b^2 below 1/3. db = b - b_c is passed
+// separately so that near-critical orbits keep their precision (solved for w = 1/3 - u_p there).
+function uniPeri(b, db) {
+  const e = 1 / b, dl = db / (b * BC) * (1 / BC + e);    // e_c^2 - e^2 = w^2 (1 - 2w)
+  if (dl < 0.01) {
+    let w = Math.sqrt(dl);
+    for (let k = 0; k < 60; k++) { const dw = (w * w * (1 - 2 * w) - dl) / (2 * w - 6 * w * w); w -= dw; if (!(Math.abs(dw) > 1e-18)) break; }
+    return 1 / 3 - w;
+  }
+  let u = e;
+  for (let k = 0; k < 60; k++) { const du = (u * u * (1 - 2 * u) - e * e) / (2 * u - 6 * u * u); u -= du; if (!(Math.abs(du) > 1e-19)) break; }
+  return u;
+}
+
+// Cubic Hermite on the dense trajectory TR_U/TR_V (step h, n steps): value and derivative at x.
+const TA = [0, 0];
+function trAt(x, h, n) {
+  let i = Math.floor(x / h); if (i > n - 1) i = n - 1; if (i < 0) i = 0;
+  const t = x / h - i, t2 = t * t, t3 = t2 * t;
+  const u0 = TR_U[i], u1 = TR_U[i + 1], d0 = TR_V[i] * h, d1 = TR_V[i + 1] * h;
+  TA[0] = (2 * t3 - 3 * t2 + 1) * u0 + (t3 - 2 * t2 + t) * d0 + (-2 * t3 + 3 * t2) * u1 + (t3 - t2) * d1;
+  TA[1] = ((6 * t2 - 6 * t) * u0 + (3 * t2 - 4 * t + 1) * d0 + (-6 * t2 + 6 * t) * u1 + (3 * t2 - 2 * t) * d1) / h;
+  return TA;
+}
+// x where the trajectory crosses `target` inside step interval i (bisection on the Hermite cubic).
+function trRoot(i, h, target) {
+  const up = TR_U[i] < target;
+  let lo = i * h, hi = (i + 1) * h;
+  for (let k = 0; k < 60; k++) {
+    const m = 0.5 * (lo + hi);
+    if ((trAt(m, h, i + 1)[0] < target) === up) lo = m; else hi = m;
+  }
+  return 0.5 * (lo + hi);
+}
+// RK4 on u'' = 3u^2 - u (Binet, M = 1) from (u, v), step h, until stop(u). Fills TR_U/TR_V, returns n.
+function trIntegrate(u, v, h, stop) {
+  let n = 0;
+  TR_U[0] = u; TR_V[0] = v;
+  while (!stop(u)) {
+    const a1 = v, b1 = 3 * u * u - u;
+    let w = u + 0.5 * h * a1;
+    const a2 = v + 0.5 * h * b1, b2 = 3 * w * w - w;
+    w = u + 0.5 * h * a2;
+    const a3 = v + 0.5 * h * b2, b3 = 3 * w * w - w;
+    w = u + h * a3;
+    const a4 = v + h * b3, b4 = 3 * w * w - w;
+    u += h / 6 * (a1 + 2 * a2 + 2 * a3 + a4);
+    v += h / 6 * (b1 + 2 * b2 + 2 * b3 + b4);
+    if (++n >= TRMAX) throw new Error('trIntegrate: too many steps');
+    TR_U[n] = u; TR_V[n] = v;
+  }
+  return n;
+}
+
+function uniBuildRow(k, UNI, PHI, UP) {
+  const db = uniDb(k), b = BC + db, o = k * NS * 2;
+  if (k < NB) {                                   // side 0: infinity -> horizon
+    UP[k] = 0.5;
+    if (b < 1e-9) {                               // b -> 0 limit: u = psi / b, PHI = b / 2
+      PHI[k] = 0;
+      for (let j = 0; j < NS; j++) { UNI[o + 2 * j] = 0.5 * j / (NS - 1); UNI[o + 2 * j + 1] = 0.5; }
+      return;
+    }
+    const h = H_INT * Math.min(1, b / BC);
+    const n = trIntegrate(0, 1 / b, h, u => u >= 0.5);
+    const P = trRoot(n - 1, h, 0.5);
+    PHI[k] = P;
+    for (let j = 0; j < NS; j++) {
+      const r = trAt(j / (NS - 1) * P, h, n);
+      UNI[o + 2 * j] = r[0]; UNI[o + 2 * j + 1] = r[1] * P;
+    }
+  } else {                                        // side 1: integrate outward from the periapsis
+    const up = uniPeri(b, db), h = H_INT;
+    const n = trIntegrate(up, 0, h, u => u <= 0);
+    const P = trRoot(n - 1, h, 0);
+    PHI[k] = P; UP[k] = up;
+    const qd0 = Math.sqrt((up - 3 * up * up) / (2 * up));   // dq/dpsi' at the periapsis
+    for (let j = 0; j < NS; j++) {
+      const sg = j / (NS - 1), r = trAt((1 - sg) * P, h, n);  // psi' = PHI - psi, from the periapsis
+      const q = Math.sqrt(Math.max(0, 1 - r[0] / up));
+      const dq = q > 1e-9 ? -r[1] / (2 * up * q) : qd0;     // dq/dpsi'
+      UNI[o + 2 * j] = q; UNI[o + 2 * j + 1] = -dq * P;
+    }
+  }
+}
+
+function buildUniversal() {
+  const UNI = new Float32Array(NU * NS * 2), PHI = new Float64Array(NU), UP = new Float64Array(NU);
+  for (let k = 0; k < NU; k++) uniBuildRow(k, UNI, PHI, UP);
+  return { UNI, PHI, UP };
+}
+
+// Catmull-Rom weights for rows i-1..i+2 at fraction t. At the ends of a side the missing row is a
+// linear extrapolation (row -1 = 2 row0 - row1), folded into the weights.
+function crw(t, i, w) {
+  const t2 = t * t, t3 = t2 * t;
+  w[0] = 0.5 * (-t + 2 * t2 - t3); w[1] = 0.5 * (2 - 5 * t2 + 3 * t3);
+  w[2] = 0.5 * (t + 4 * t2 - 3 * t3); w[3] = 0.5 * (t3 - t2);
+  if (i === 0) { w[1] += 2 * w[0]; w[2] -= w[0]; w[0] = 0; }
+  if (i === NB - 2) { w[2] += 2 * w[3]; w[1] -= w[3]; w[3] = 0; }
+  return w;
+}
+// Table value at (side, local row coordinate rl, sigma). Mirrored in GLSL (FS_CAMTAB).
+const CRW = [0, 0, 0, 0];
+function uniAt(UNI, side, rl, sg) {
+  rl = clampv(rl, 0, NB - 1);
+  const i = Math.min(Math.floor(rl), NB - 2), w = crw(rl - i, i, CRW);
+  const x = clampv(sg, 0, 1) * (NS - 1), j = Math.min(Math.floor(x), NS - 2);
+  const s = x - j, s2 = s * s, s3 = s2 * s, dS = 1 / (NS - 1);
+  const h00 = 2 * s3 - 3 * s2 + 1, h10 = (s3 - 2 * s2 + s) * dS, h01 = -2 * s3 + 3 * s2, h11 = (s3 - s2) * dS;
+  let v = 0;
+  for (let m = 0; m < 4; m++) {
+    const o = ((side * NB + clampv(i - 1 + m, 0, NB - 1)) * NS + j) * 2;
+    v += w[m] * (h00 * UNI[o] + h10 * UNI[o + 1] + h01 * UNI[o + 2] + h11 * UNI[o + 3]);
+  }
+  return v;
+}
+// PHI at (side, rl): Catmull-Rom, extrapolated linearly in log|b - b_c| below row 0 (PHI ~ -log/2 there).
+function phiAt(PHI, side, rl) {
+  const o = side * NB;
+  if (rl < 0) return PHI[o] + rl * (PHI[o + 1] - PHI[o]);
+  rl = Math.min(rl, NB - 1);
+  const i = Math.min(Math.floor(rl), NB - 2), w = crw(rl - i, i, CRW);
+  let v = 0;
+  for (let m = 0; m < 4; m++) v += w[m] * PHI[o + clampv(i - 1 + m, 0, NB - 1)];
+  return v;
+}
+// sigma where the table value equals target (side 0: u, increasing; side 1: q, decreasing).
+// Illinois (regula falsi) on [0, 1]: monotonic and smooth, so a handful of iterations suffices.
+function uniInvert(UNI, side, rl, target) {
+  let a = 0, b = 1, fa = uniAt(UNI, side, rl, 0) - target, fb = uniAt(UNI, side, rl, 1) - target;
+  if (fa * fb > 0) return Math.abs(fa) < Math.abs(fb) ? 0 : 1;
+  for (let k = 0; k < 60 && Math.abs(b - a) > 1e-13; k++) {
+    const c = (a * fb - b * fa) / (fb - fa), fc = uniAt(UNI, side, rl, c) - target;
+    if (fc === 0) return c;
+    if (fc * fb < 0) { a = b; fa = fb; b = c; fb = fc; }
+    else { b = c; fb = fc; fa *= 0.5; }
+    if (Math.abs(fb) < 1e-15) return b;
+  }
+  return Math.abs(fa) < Math.abs(fb) ? a : b;
+}
+
+// Per-distance camera rows from the universal tables.
+// ROW[i] = (D, global universal row coordinate (-1: no disk), s * PHI, u_p), s = +1 inward, -1 outward.
+// Along the ray, psi = D + s*phi (mirrored at PHI on side 1), u = table(psi / PHI).
+function buildCam(R, uni) {
+  const thc = critTheta(R), uc = 1 / R, K = R / Math.sqrt(1 - 2 / R);
+  const END = new Float32Array(NTH), ROW = new Float32Array(NTH * 4), X = new Float64Array(NTH);
+  for (let i = 0; i < NTH; i++) {
+    const th = rowTheta(i, thc), o = i * 4;
+    X[i] = Math.log(Math.abs(th - thc));
+    if (i < NH && R < 3) {                        // inside the photon sphere: captured rays stay at r < 3
+      END[i] = 0; ROW[o] = 0; ROW[o + 1] = -1; ROW[o + 2] = 1; ROW[o + 3] = 0;
+      continue;
+    }
+    const db = 2 * K * Math.cos(0.5 * (th + thc)) * Math.sin(0.5 * (th - thc));   // b - b_c, stable
+    const s = th < PI / 2 ? 1 : -1, side = db > 0 ? 1 : 0;
+    const rl = uniRowCoord(db), Phi = phiAt(uni.PHI, side, rl);
+    let D, up = 0.5;
+    if (side) {
+      up = uniPeri(BC + db, db);
+      D = uniInvert(uni.UNI, 1, rl, Math.sqrt(Math.max(0, 1 - uc / up))) * Phi;
+      END[i] = s > 0 ? 2 * Phi - D : D;
+    } else {
+      D = uniInvert(uni.UNI, 0, rl, uc) * Phi;
+      END[i] = s > 0 ? Phi - D : D;
+    }
+    ROW[o] = D; ROW[o + 1] = side * NB + clampv(rl, 0, NB - 1); ROW[o + 2] = s * Phi; ROW[o + 3] = up;
+  }
+  return Object.assign({ R, thc, END, ROW }, buildInv(END, X));
+}
+
+
+// Linear sRGB radiance of a blackbody at log-spaced temperatures (visible band only), via the
+// Wyman/Sloan/Shirley 2013 analytic CIE 1931 fit. Units: Y(6500K) = 1.
+const NBB = 256, BB_T0 = 300, BB_T1 = 1e6;
+function buildBB() {
+  const g = (x, m, s1, s2) => { const t = (x - m) / (x < m ? s1 : s2); return Math.exp(-0.5 * t * t); };
+  const cmf = (l) => [
+    1.056 * g(l, 599.8, 37.9, 31.0) + 0.362 * g(l, 442.0, 16.0, 26.7) - 0.065 * g(l, 501.1, 20.4, 26.2),
+    0.821 * g(l, 568.8, 46.9, 40.5) + 0.286 * g(l, 530.9, 16.3, 31.1),
+    1.217 * g(l, 437.0, 11.8, 36.0) + 0.681 * g(l, 459.0, 26.0, 13.8)];
+  const xyz = (T) => {
+    let X = 0, Y = 0, Z = 0;
+    for (let l = 360; l <= 830; l += 2) {
+      const B = Math.pow(l * 1e-3, -5) / Math.expm1(1.4388e7 / (l * T));   // Planck, relative
+      const c = cmf(l); X += B * c[0]; Y += B * c[1]; Z += B * c[2];
+    }
+    return [X, Y, Z];
+  };
+  const norm = 1 / xyz(6500)[1];
+  const out = new Float32Array(NBB * 4);
+  for (let k = 0; k < NBB; k++) {
+    const T = Math.exp(Math.log(BB_T0) + (Math.log(BB_T1) - Math.log(BB_T0)) * k / (NBB - 1));
+    const [X, Y, Z] = xyz(T).map(v => v * norm);
+    out[k * 4 + 0] = Math.max(0, 3.2406 * X - 1.5372 * Y - 0.4986 * Z);
+    out[k * 4 + 1] = Math.max(0, -0.9689 * X + 1.8758 * Y + 0.0415 * Z);
+    out[k * 4 + 2] = Math.max(0, 0.0557 * X - 0.2040 * Y + 1.0570 * Z);
+    out[k * 4 + 3] = Y;
+  }
+  return out;
+}
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// Galactic frame shared with the Milky Way shader.
+const norm3 = (v) => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const GAL_N = norm3([0.35, -0.45, 0.82]);
+const GAL_X = norm3(cross3(GAL_N, [1, 0, 0]));
+const GAL_Y = cross3(GAL_N, GAL_X);
+
+// Stars: [dirx, diry, dirz, flux, T]. Flux 1 = magnitude 0.
+function genStars(n, seed, magMax) {
+  const rng = mulberry32(seed);
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * PI * rng());
+  const out = new Float32Array(n * 5);
+  for (let i = 0; i < n; i++) {
+    let d;
+    if (rng() < 0.4) {
+      const lon = 2 * PI * rng(), lat = gauss() * 0.12, cl = Math.cos(lat);
+      d = [0, 1, 2].map(k => cl * (Math.cos(lon) * GAL_X[k] + Math.sin(lon) * GAL_Y[k]) + Math.sin(lat) * GAL_N[k]);
+    } else {
+      const z = 2 * rng() - 1, p = 2 * PI * rng(), s = Math.sqrt(1 - z * z);
+      d = [s * Math.cos(p), s * Math.sin(p), z];
+    }
+    const mag = Math.max(-1.5, magMax + 2 * Math.log10(1 - rng()));   // N(<m) ~ 10^(0.5 m)
+    out.set(d, i * 5);
+    out[i * 5 + 3] = Math.pow(10, -0.4 * mag);
+    out[i * 5 + 4] = Math.exp(Math.log(2800) + Math.log(30000 / 2800) * Math.pow(rng(), 2.5));
+  }
+  return out;
+}
+
+
+// ============================================================ GL setup
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+const info = document.getElementById('info');
+if (!gl) throw (info.textContent = 'WebGL2 not available');
+if (!gl.getExtension('EXT_color_buffer_float')) info.textContent = 'EXT_color_buffer_float missing: no HDR target';
+
+const f = (x) => x.toFixed(10);   // JS number -> GLSL float literal
+const GLSL_CONSTS = `
+const float PI = 3.14159265358979;
+const int NH = ${NH}, NPHI = ${NPHI}, NINV = ${NINV}, NBB = ${NBB}, NB = ${NB}, NS = ${NS};
+const float LOG_EPS = ${f(LOG_EPS)};
+const float DPHI = ${f(DPHI)}, PHIMAX = ${f(PHIMAX)}, DPHIINV = ${f(DPHIINV)};
+const float LOGT0 = ${f(Math.log(BB_T0))}, LOGT1 = ${f(Math.log(BB_T1))}, BB_T1 = ${f(BB_T1)};
+const vec3 GAL_N = vec3(${GAL_N.map(f)}), GAL_X = vec3(${GAL_X.map(f)}), GAL_Y = vec3(${GAL_Y.map(f)});
+`;
+
+const COMMON = `
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+${GLSL_CONSTS}
+uniform sampler2D uTabU, uTabEnd, uInv, uBB;
+uniform vec3 uCam, uCamR, uCamU, uCamF, uPerp;
+uniform vec2 uRes;
+uniform float uFocal, uR, uGcam, uThc, uLogThc, uLogPmc;
+uniform float uDiskOn, uRin, uRout, uTdisk, uTnorm, uOpacity, uTime, uFlowT;
+
+// theta -> (side, continuous row index within that side)
+void thetaIndex(float th, out int side, out float t) {
+  if (th < uThc) { side = 0; t = (log(max(uThc - th, 1e-30)) - uLogThc) / (LOG_EPS - uLogThc); }
+  else           { side = 1; t = (log(max(th - uThc, 1e-30)) - LOG_EPS) / (uLogPmc - LOG_EPS); }
+  t = clamp(t, 0.0, 1.0) * float(NH - 1);
+}
+float endLookup(int side, float t) {
+  int i0 = min(int(t), NH - 2); float fr = t - float(i0); int x = side * NH + i0;
+  return mix(texelFetch(uTabEnd, ivec2(x, 0), 0).r, texelFetch(uTabEnd, ivec2(x + 1, 0), 0).r, fr);
+}
+float uLookup(int side, float t, float phi) {
+  int i0 = min(int(t), NH - 2); float fr = t - float(i0); int x = side * NH + i0;
+  float pj = phi / DPHI; int j0 = min(int(pj), NPHI - 2); float g = pj - float(j0);
+  float a = texelFetch(uTabU, ivec2(x, j0), 0).r,     b = texelFetch(uTabU, ivec2(x + 1, j0), 0).r;
+  float c = texelFetch(uTabU, ivec2(x, j0 + 1), 0).r, d = texelFetch(uTabU, ivec2(x + 1, j0 + 1), 0).r;
+  return mix(mix(a, b, fr), mix(c, d, fr), g);
+}
+vec4 bbFetch(int k) { return texelFetch(uBB, ivec2(k, 0), 0); }
+// Linear sRGB radiance (rgb) and luminance (a) of a blackbody at temperature T.
+vec4 bb(float T) {
+  float x = (log(max(T, 1.0)) - LOGT0) / (LOGT1 - LOGT0) * float(NBB - 1);
+  if (x <= 0.0) return vec4(0.0);
+  if (x >= float(NBB - 1)) return bbFetch(NBB - 1) * (T / BB_T1);   // Rayleigh-Jeans tail
+  int k = int(x);
+  return mix(bbFetch(k), bbFetch(k + 1), x - float(k));
+}
+
+float hash3(vec3 p) {
+  p = fract(p * 0.3183099 + 0.1); p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float vnoise(vec3 x) {
+  vec3 i = floor(x), w = fract(x); w = w * w * (3.0 - 2.0 * w);
+  return mix(mix(mix(hash3(i), hash3(i + vec3(1,0,0)), w.x), mix(hash3(i + vec3(0,1,0)), hash3(i + vec3(1,1,0)), w.x), w.y),
+             mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), w.x), mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), w.x), w.y), w.z);
+}
+float fbm(vec3 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = p * 2.03 + vec3(1.7, 9.2, 3.1); a *= 0.5; }
+  return s / 0.9375;
+}
+
+// Disk gas density in [0,1]: noise advected at Keplerian speed, two-phase flow-map blend so the
+// differential rotation never winds the pattern up indefinitely.
+float diskDensity(float r, float az) {
+  float om = pow(r, -1.5);
+  float tt = uTime / uFlowT, fa = fract(tt), fb = fract(tt + 0.5);
+  float wa = 1.0 - abs(2.0 * fa - 1.0);
+  float aa = az - om * fa * uFlowT, ab = az - om * fb * uFlowT;
+  float lr = log(r) * 14.0;
+  float na = fbm(vec3(cos(aa) * 1.6, sin(aa) * 1.6, lr) + floor(tt) * 3.7);
+  float nb = fbm(vec3(cos(ab) * 1.6, sin(ab) * 1.6, lr) + floor(tt + 0.5) * 3.7 + 19.1);
+  return smoothstep(0.25, 0.8, mix(nb, na, wa));
+}
+
+float tempProfile(float r) {       // thin disk, zero torque at uRin; normalised to peak 1
+  return pow(max((1.0 - sqrt(uRin / r)) / (r * r * r), 0.0) / uTnorm, 0.25);
+}
+// g = E_camera / E_emitter: gravitational shift x Doppler of the Keplerian orbit (circular, r >= 3).
+float shiftFactor(float r, float lam) {
+  return uGcam * sqrt(1.0 - 3.0 / r) / max(1.0 - pow(r, -1.5) * lam, 1e-3);
+}
+
+// Shade one disk crossing at radius r, position p (lam = photon L_z/E), compositing front to back.
+// Emission is a blackbody at g * T_emitted (I_nu / nu^3 invariant), so beaming is included.
+void diskHit(float r, vec3 p, float lam, inout vec3 acc, inout float T) {
+  float dens = diskDensity(r, atan(p.y, p.x));
+  float edge = smoothstep(uRin, uRin + 0.2, r) * (1.0 - smoothstep(uRout * 0.7, uRout, r));
+  float a = (1.0 - exp(-uOpacity * (0.15 + 2.0 * dens))) * edge;
+  float Te = uTdisk * tempProfile(r);
+  vec4 em = bb(shiftFactor(r, lam) * Te);
+  acc += T * a * em.rgb * (0.3 + 1.4 * dens);
+  T *= 1.0 - a;
+}
+
+// Thin disk in z=0. Ray plane basis e1 (hole->camera), e2 (ray sweeps toward +phi), n = e1 x e2.
+// Crossings are at phi0 + k*pi. Returns (emitted rgb, remaining transmittance).
+vec4 diskTrace(int side, float t, float th, vec3 e1, vec3 e2, vec3 n, float phiEnd) {
+  vec3 acc = vec3(0.0); float T = 1.0;
+  if (uDiskOn < 0.5) return vec4(acc, T);
+  float b = uR * sin(th) / sqrt(1.0 - 2.0 / uR);
+  float lam = -b * n.z;                      // photon L_z/E (sign flipped: we trace backward)
+  float phi0 = atan(-e1.z, e2.z); phi0 -= PI * floor(phi0 / PI);
+  for (int k = 0; k < 4; k++) {
+    float ph = phi0 + float(k) * PI;
+    if (ph >= phiEnd || ph > PHIMAX) break;
+    if (ph < 1e-4) continue;
+    float u = uLookup(side, t, ph);
+    if (u <= 0.0) continue;
+    float r = 1.0 / u;
+    if (r < uRin || r > uRout) continue;
+    diskHit(r, r * (cos(ph) * e1 + sin(ph) * e2), lam, acc, T);
+    if (T < 0.003) break;
+  }
+  return vec4(acc, T);
+}
+`;
+
+const VS_FULL = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// Procedural Milky Way at unit brightness (static in world space), baked once into a cubemap
+// (FS_SKYBAKE) that the scene pass samples.
+const MILKY = `
+vec3 milkyWay(vec3 dir) {
+  float b = dot(dir, GAL_N), l = atan(dot(dir, GAL_Y), dot(dir, GAL_X));
+  float band = exp(-b * b / (2.0 * 0.10 * 0.10)) * (0.35 + 0.65 * exp(-l * l / 1.5));
+  float bulge = exp(-(b * b * 4.0 + l * l) / (2.0 * 0.25 * 0.25));
+  float nz = fbm(dir * 5.0 + 3.0);
+  float dust = smoothstep(0.45, 0.75, fbm(dir * 9.0 + 11.0)) * exp(-b * b / (2.0 * 0.035 * 0.035));
+  vec3 c = vec3(0.85, 0.85, 0.9) * band * (0.3 + 1.4 * nz * nz) + vec3(1.0, 0.8, 0.55) * bulge * 1.5;
+  return c * (1.0 - 0.85 * dust);
+}`;
+
+// Bake one cubemap face: texel (s, t) of face uFace -> direction (OpenGL cube face convention).
+const FS_SKYBAKE = `#version 300 es
+${COMMON}
+${MILKY}
+uniform int uFace;
+uniform float uN;
+out vec4 outColor;
+void main() {
+  vec2 st = gl_FragCoord.xy / uN * 2.0 - 1.0;
+  float sc = st.x, tc = st.y;
+  vec3 d = uFace == 0 ? vec3(1.0, -tc, -sc) : uFace == 1 ? vec3(-1.0, -tc, sc)
+         : uFace == 2 ? vec3(sc, 1.0, tc)   : uFace == 3 ? vec3(sc, -1.0, -tc)
+         : uFace == 4 ? vec3(sc, -tc, 1.0)  : vec3(-sc, -tc, -1.0);
+  outColor = vec4(milkyWay(normalize(d)), 1.0);
+}`;
+
+const SKY_N = 1024;   // cubemap face size
+const FS_SCENE = `#version 300 es
+${COMMON}
+precision highp samplerCube;
+uniform float uSkyMode;   // 0 milky way, 1 grid, 2 off
+uniform vec3 uMilky;      // Milky Way brightness x the camera's blueshift tint (skyShift())
+uniform samplerCube uSky;
+uniform float uAA;
+out vec4 outColor;
+const float SKY_N = ${f(SKY_N)}, SKY_BIAS = -1.0;   // cubemap size, lod bias
+const float AA_STEP = 0.05;                          // ring AA: END change (rad) per sub-sample
+const int AA_MAX = 32;                               // ring AA: max sub-samples
+
+// Procedural sky: the grid, or nothing. (The Milky Way cubemap is sampled in main().)
+vec3 skyColor(vec3 dir) {
+  if (uSkyMode > 1.5) return vec3(0.0);
+  float lon = atan(dir.y, dir.x), lat = asin(clamp(dir.z, -1.0, 1.0));   // lat/long checker grid, world frame
+  float c = PI / 12.0;
+  float gx = abs(fract(lon / c + 0.5) - 0.5), gy = abs(fract(lat / c + 0.5) - 0.5);
+  float line = 1.0 - smoothstep(0.02, 0.06, min(gx, gy));
+  float chk = mod(floor(lon / (2.0 * c)) + floor(lat / (2.0 * c)), 2.0);
+  vec3 base = mix(vec3(0.10, 0.14, 0.30), vec3(0.30, 0.16, 0.08), chk);
+  if (dir.z < 0.0) base = base.gbr;
+  return (base + line * 0.6) * 0.3;
+}
+
+void main() {
+  vec2 p = (2.0 * gl_FragCoord.xy - uRes) / uRes.y;
+  vec3 d = normalize(uCamR * p.x + uCamU * p.y + uCamF * uFocal);
+  vec3 e1 = normalize(uCam);
+  vec3 dp = d - dot(d, e1) * e1;
+  float sl = length(dp);
+  vec3 e2 = sl > 1e-9 ? dp / sl : uPerp;
+  float th = atan(sl, -dot(d, e1));           // angle from the inward direction
+  // theta derivatives in uniform control flow: |dth/dx| + |dth/dy| is the range of theta over the pixel
+  vec2 thG = abs(vec2(dFdx(th), dFdy(th)));
+  int side; float t;
+  thetaIndex(th, side, t);
+  float phiEnd = endLookup(side, t);
+  vec4 dk = diskTrace(side, t, th, e1, e2, cross(e1, e2), phiEnd);
+  bool esc = side == 1;
+  vec3 dir = cos(phiEnd) * e1 + sin(phiEnd) * e2;
+  // Milky Way cubemap: the filter footprint comes from the screen derivatives of the escape direction,
+  // so the lookup must run in uniform control flow (only uniforms decide whether it runs). Near the
+  // shadow edge the footprint grows without bound and the mips filter the compressed sky. At the edge
+  // itself a captured neighbour gives a meaningless (large) difference: the lowest mips, roughly the
+  // sky's average. texture() + bias: implicit derivatives, hardware aniso.
+  vec3 cube = vec3(0.0);
+  if (uSkyMode < 0.5) cube = texture(uSky, dir, SKY_BIAS).rgb * uMilky;
+  vec3 n = cross(e1, e2);
+  // Out-of-plane footprint of the escape direction (around the ring): used by the ring AA's sky lookups.
+  float ft = max(abs(dot(dFdx(dir), n)), abs(dot(dFdy(dir), n)));
+  vec3 sky = !esc ? vec3(0.0) : uSkyMode < 0.5 ? cube : skyColor(dir);
+  vec3 col = dk.rgb + sky * dk.a; float T = dk.a;
+
+  // Ring AA. Near theta_c the escape angle END(theta) and the disk crossings change faster than the
+  // pixel grid samples them; around the ring (phi) everything is smooth. So: filter in theta only.
+  // The pixel covers theta in [th - w/2, th + w/2], w = |dth/dx| + |dth/dy|, with a trapezoid density
+  // (a square pixel's projection onto the theta gradient). If END changes by more than AA_STEP over
+  // that range, or the range straddles the shadow edge, take n = ceil(dEND / AA_STEP) <= AA_MAX
+  // sub-samples in theta, weighted by the trapezoid. Each sub-sample's sky lookup uses an explicit lod
+  // from its own footprint: |END| change across its sub-interval (in the ray plane) or ft (out of plane).
+  if (uAA > 0.5) {
+    float a = max(min(thG.x, thG.y), 1e-6 * max(thG.x, thG.y) + 1e-12), b = max(thG.x, thG.y), w = a + b;
+    float lo = max(th - 0.5 * w, 0.0), hi = min(th + 0.5 * w, PI);
+    int sl0, sl1; float tl0, tl1;
+    thetaIndex(lo, sl0, tl0); thetaIndex(hi, sl1, tl1);
+    float el = endLookup(sl0, tl0), eh = endLookup(sl1, tl1);
+    float dphi = sl0 != sl1 ? 1e9 : abs(eh - el);
+    int nSS = int(clamp(ceil(dphi / AA_STEP), 1.0, float(AA_MAX)));
+    if (nSS > 1) {
+      bool cubeOn = uSkyMode < 0.5;
+      col = vec3(0.0); T = 0.0;
+      float x0 = th - 0.5 * w, dx = w / float(nSS);
+      float F0 = 0.0, eb0 = el; int sb0 = sl0;
+      for (int i = 0; i < 64; i++) {
+        if (i >= nSS) break;
+        // trapezoid CDF (sum of uniforms of widths a <= b) at the sub-interval's upper boundary
+        float x = float(i + 1) * dx;
+        float F1 = x < a ? x * x / (2.0 * a * b) : x < b ? (2.0 * x - a) / (2.0 * b) : 1.0 - (w - x) * (w - x) / (2.0 * a * b);
+        if (i == nSS - 1) F1 = 1.0;
+        float wt = F1 - F0; F0 = F1;
+        float thb = clamp(x0 + x, 0.0, PI);
+        int sb1; float tb1; thetaIndex(thb, sb1, tb1);
+        float eb1 = endLookup(sb1, tb1);
+        float thi = clamp(x0 + (float(i) + 0.5) * dx, 0.0, PI);
+        int si; float ti; thetaIndex(thi, si, ti);
+        float pe = endLookup(si, ti);
+        vec4 dki = diskTrace(si, ti, thi, e1, e2, n, pe);
+        vec3 ski = vec3(0.0);
+        if (si == 1) {
+          vec3 di = cos(pe) * e1 + sin(pe) * e2;
+          if (cubeOn) {
+            float fp = max(sb0 != sb1 ? 4.0 * PI : abs(eb1 - eb0), ft);
+            ski = textureLod(uSky, di, log2(max(fp * SKY_N * 0.5, 1e-6)) + SKY_BIAS).rgb * uMilky;
+          } else ski = skyColor(di);
+        }
+        col += wt * (dki.rgb + ski * dki.a); T += wt * dki.a;
+        eb0 = eb1; sb0 = sb1;
+      }
+    }
+  }
+  // alpha = transmittance of the disk in front of the sky; the star pass blends with DST_ALPHA.
+  outColor = vec4(col, T);
+}`;
+
+// Forward-mapped stars: each star (vertex) x image order (instance) -> one point sprite.
+const VS_STARS = `#version 300 es
+${COMMON}
+uniform float uInvMax, uMuMax, uStarGain, uStarSize;
+in vec3 aDir; in float aFlux; in float aTemp;
+out vec3 vCol;
+void main() {
+  gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vCol = vec3(0.0);
+  int k = gl_InstanceID;
+  vec3 e1 = normalize(uCam);
+  float cb = dot(aDir, e1);
+  vec3 w = aDir - cb * e1; float wl = length(w);
+  w = wl > 1e-9 ? w / wl : uPerp;
+  float beta = atan(wl, cb);                  // source angle from e1, [0, pi]
+  float Phi = k == 0 ? beta : k == 1 ? 2.0 * PI - beta : k == 2 ? 2.0 * PI + beta : 4.0 * PI - beta;
+  vec3 e2 = (k == 1 || k == 3) ? -w : w;
+  if (Phi > uInvMax) return;
+  float jp = Phi / DPHIINV; int j0 = min(int(jp), NINV - 2);
+  float x0 = texelFetch(uInv, ivec2(j0, 0), 0).r, x1 = texelFetch(uInv, ivec2(j0 + 1, 0), 0).r;
+  float x = mix(x0, x1, jp - float(j0));
+  float th = uThc + exp(x);
+  float dthdP = exp(x) * abs(x1 - x0) / DPHIINV;
+  float mu = min(sin(th) * dthdP / max(abs(sin(Phi)), 1e-5), uMuMax);   // magnification
+  vec3 d = -cos(th) * e1 + sin(th) * e2;
+  vec3 c = vec3(dot(d, uCamR), dot(d, uCamU), dot(d, uCamF));
+  if (c.z <= 1e-4) return;
+  vec2 sp = c.xy * uFocal / c.z;
+  gl_Position = vec4(sp.x * uRes.y / uRes.x, sp.y, 0.0, 1.0);
+  vec4 em = bb(uGcam * aTemp), e0 = bb(aTemp);   // camera blueshift, brightness included
+  vec3 col = em.rgb / max(e0.a, 1e-30);
+  vCol = col * aFlux * mu * uStarGain;   // disk occlusion: in the blend (dst alpha)
+  gl_PointSize = uStarSize;
+}`;
+
+const FS_STARS = `#version 300 es
+precision highp float;
+uniform float uStarSize, uStarSigma;
+in vec3 vCol;
+out vec4 outColor;
+void main() {
+  vec2 q = (gl_PointCoord - 0.5) * uStarSize;
+  float w = exp(-dot(q, q) / (2.0 * uStarSigma * uStarSigma)) / (6.2831853 * uStarSigma * uStarSigma);
+  outColor = vec4(vCol * w, 1.0);
+}`;
+
+// ---- glare (bloom). The image is convolved with a sum of blurs at doubling widths: a 13-tap
+// downsample chain (Jimenez 2014, without the Karis average, which would remove the stars' energy),
+// then a tent upsample that blends each level in with its weight. Weights come from the encircled
+// energy of the eye's PSF (bloomWeights). Linear and energy conserving: the total light is unchanged.
+const BLOOM_TENT = `
+vec3 tent(sampler2D s, vec2 uv, vec2 t) {
+  return (4.0 * texture(s, uv).rgb
+    + 2.0 * (texture(s, uv + vec2(t.x, 0.0)).rgb + texture(s, uv - vec2(t.x, 0.0)).rgb
+           + texture(s, uv + vec2(0.0, t.y)).rgb + texture(s, uv - vec2(0.0, t.y)).rgb)
+    + texture(s, uv + t).rgb + texture(s, uv - t).rgb
+    + texture(s, uv + vec2(t.x, -t.y)).rgb + texture(s, uv + vec2(-t.x, t.y)).rgb) / 16.0;
+}`;
+const FS_BLOOM_DOWN = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform vec2 uSrcTexel, uDstInv;
+out vec4 outColor;
+vec3 T(vec2 uv, float x, float y) {
+  vec3 c = texture(uSrc, uv + vec2(x, y) * uSrcTexel).rgb;
+  return any(isnan(c)) ? vec3(0.0) : min(c, vec3(6e4));   // half-float overflow guard
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy * uDstInv;
+  vec3 r = 0.125 * T(uv, 0.0, 0.0)
+    + 0.03125 * (T(uv, -2.0, 2.0) + T(uv, 2.0, 2.0) + T(uv, -2.0, -2.0) + T(uv, 2.0, -2.0))
+    + 0.0625 * (T(uv, 0.0, 2.0) + T(uv, -2.0, 0.0) + T(uv, 2.0, 0.0) + T(uv, 0.0, -2.0))
+    + 0.125 * (T(uv, -1.0, 1.0) + T(uv, 1.0, 1.0) + T(uv, -1.0, -1.0) + T(uv, 1.0, -1.0));
+  outColor = vec4(r, 1.0);
+}`;
+// Writes tent(level j+1); blending (constant alpha rho_j) mixes it into level j.
+const FS_BLOOM_UP = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform vec2 uSrcTexel, uDstInv;
+out vec4 outColor;
+${BLOOM_TENT}
+void main() { outColor = vec4(tent(uSrc, gl_FragCoord.xy * uDstInv, uSrcTexel), 1.0); }`;
+
+const FS_TONE = `#version 300 es
+precision highp float;
+uniform sampler2D uHdr, uBloom;
+uniform vec2 uRes, uBloomTexel;
+uniform float uExposure, uBloomMix;
+out vec4 outColor;
+${BLOOM_TENT}
+vec3 aces(vec3 x) { return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uHdr, uv).rgb;
+  if (uBloomMix > 0.0) c = mix(c, tent(uBloom, uv, uBloomTexel), uBloomMix);
+  c = aces(c * uExposure);
+  c = mix(12.92 * c, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+  outColor = vec4(c, 1.0);
+}`;
+
+// Camera table U(theta row, phi) from the universal tables: one texel per (row, phi sample).
+// Mirrors uniAt() in the core.
+const FS_CAMTAB = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+${GLSL_CONSTS}
+uniform sampler2D uUni, uRow, uEndT;
+out vec4 outColor;
+float uniAt(int side, float rl, float sg) {
+  rl = clamp(rl, 0.0, float(NB - 1));
+  int i = min(int(rl), NB - 2);
+  float t = rl - float(i), t2 = t * t, t3 = t2 * t;
+  vec4 w = 0.5 * vec4(-t + 2.0 * t2 - t3, 2.0 - 5.0 * t2 + 3.0 * t3, t + 4.0 * t2 - 3.0 * t3, t3 - t2);
+  if (i == 0)      { w.y += 2.0 * w.x; w.z -= w.x; w.x = 0.0; }
+  if (i == NB - 2) { w.z += 2.0 * w.w; w.y -= w.w; w.w = 0.0; }
+  float x = clamp(sg, 0.0, 1.0) * float(NS - 1);
+  int j = min(int(x), NS - 2);
+  float s = x - float(j), s2 = s * s, s3 = s2 * s, dS = 1.0 / float(NS - 1);
+  vec4 hb = vec4(2.0 * s3 - 3.0 * s2 + 1.0, (s3 - 2.0 * s2 + s) * dS, -2.0 * s3 + 3.0 * s2, (s3 - s2) * dS);
+  float v = 0.0;
+  for (int m = 0; m < 4; m++) {
+    int r = side * NB + clamp(i - 1 + m, 0, NB - 1);
+    vec2 a = texelFetch(uUni, ivec2(j, r), 0).rg, c = texelFetch(uUni, ivec2(j + 1, r), 0).rg;
+    v += w[m] * dot(hb, vec4(a, c));
+  }
+  return v;
+}
+void main() {
+  int i = int(gl_FragCoord.x), j = int(gl_FragCoord.y);
+  float phi = float(j) * DPHI;
+  float end = texelFetch(uEndT, ivec2(i, 0), 0).r;
+  vec4 rw = texelFetch(uRow, ivec2(i, 0), 0);          // D, global row coord (-1: none), s * PHI, u_p
+  if (phi >= end || rw.y < 0.0) { outColor = vec4(i < NH ? 1.0 : 0.0); return; }
+  float s = rw.z < 0.0 ? -1.0 : 1.0, Phi = abs(rw.z);
+  int side = rw.y >= float(NB) ? 1 : 0;
+  float psi = rw.x + s * phi;
+  if (side == 1) psi = Phi - abs(psi - Phi);           // mirror the outbound leg onto the inbound one
+  float v = uniAt(side, rw.y - float(side * NB), Phi > 0.0 ? psi / Phi : 0.0);
+  outColor = vec4(side == 1 ? rw.w * (1.0 - v * v) : v);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    info.textContent = log; console.error(log);
+    throw new Error(log);
+  }
+  return s;
+}
+function program(vs, fs, attribs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  (attribs || []).forEach((a, i) => gl.bindAttribLocation(p, i, a));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const loc = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const u = gl.getActiveUniform(p, i); loc[u.name] = gl.getUniformLocation(p, u.name); }
+  return { p, loc };
+}
+const progScene = program(VS_FULL, FS_SCENE);
+const progStars = program(VS_STARS, FS_STARS, ['aDir', 'aFlux', 'aTemp']);
+const progTone = program(VS_FULL, FS_TONE);
+const progCamTab = program(VS_FULL, FS_CAMTAB);
+const progDown = program(VS_FULL, FS_BLOOM_DOWN);
+const progUp = program(VS_FULL, FS_BLOOM_UP);
+const progSkyBake = program(VS_FULL, FS_SKYBAKE);
+const extAniso = gl.getExtension('EXT_texture_filter_anisotropic');
+const ANISO_MAX = extAniso ? gl.getParameter(extAniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 1;
+
+function floatTex(w, h, ifmt, fmt, data) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, gl.FLOAT, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const texBB = floatTex(NBB, 1, gl.RGBA32F, gl.RGBA, buildBB());
+
+// Universal tables: built once (~270 ms).
+const UNIV = buildUniversal();
+const texUni = floatTex(NS, NU, gl.RG32F, gl.RG, UNIV.UNI);
+
+// Camera table U(theta, phi): a render target, filled by the camera-table pass.
+const texU = floatTex(NTH, NPHI, gl.R32F, gl.RED, null);
+const fboU = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, fboU);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texU, 0);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+const texEnd = floatTex(NTH, 1, gl.R32F, gl.RED, null);
+const texInv = floatTex(NINV, 1, gl.R32F, gl.RED, null);
+const texRow = floatTex(NTH, 1, gl.RGBA32F, gl.RGBA, null);
+let tables = null;
+
+function upload(tex, w, fmt, data) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, data.length / w / (fmt === gl.RGBA ? 4 : 1), fmt, gl.FLOAT, data);
+}
+function camTabPass() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboU);
+  gl.viewport(0, 0, NTH, NPHI);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progCamTab.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texUni);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texRow);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texEnd);
+  gl.uniform1i(progCamTab.loc.uUni, 0); gl.uniform1i(progCamTab.loc.uRow, 1); gl.uniform1i(progCamTab.loc.uEndT, 2);
+  gl.bindVertexArray(vaoEmpty);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+// Camera tables for distance R: ~3 ms of CPU plus one small GPU pass.
+function rebuild(R) {
+  tables = buildCam(R, UNIV);
+  upload(texRow, NTH, gl.RGBA, tables.ROW);
+  upload(texEnd, NTH, gl.RED, tables.END);
+  upload(texInv, NINV, gl.RED, tables.INV);
+  camTabPass();
+  if (tables.nonMono) console.warn('END not monotonic on escaping branch:', tables.nonMono);
+}
+
+// HDR target
+let hdrTex = null, hdrFbo = null, hdrW = 0, hdrH = 0;
+function ensureTarget(w, h) {
+  if (w === hdrW && h === hdrH) return;
+  hdrW = w; hdrH = h;
+  if (hdrTex) { gl.deleteTexture(hdrTex); gl.deleteFramebuffer(hdrFbo); }
+  hdrTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, hdrTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  hdrFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, hdrFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, hdrTex, 0);
+}
+
+// ---- glare: PSF model and mip chain
+// Spencer, Shirley, Zimmerman, Greenberg (1995), photopic eye PSF, theta in degrees:
+//   P = 0.384 f0 + 0.478 f1 + 0.138 f2,  f0 = 2.61e6 exp(-(theta/0.02)^2)  (core)
+//   f1 = 20.91 / (theta + 0.02)^3  (halo),  f2 = 72.37 / (theta + 0.02)^2  (veil)
+// Each f integrates to ~3300 deg^2 (f2 out to 90 deg), so the coefficients are energy fractions.
+// Encircled energy within angle x (closed forms):
+function glareEE(x) {
+  const a = 0.02, T = 90;
+  const c0 = 1 - Math.exp(-(x / 0.02) * (x / 0.02));
+  const c1 = (x / (x + a)) * (x / (x + a));
+  const e2 = (y) => Math.log((y + a) / a) + a / (y + a) - 1;
+  const c2 = Math.min(1, e2(Math.min(x, T)) / e2(T));
+  return 0.384 * c0 + 0.478 * c1 + 0.138 * c2;
+}
+// Level i of the chain blurs at ~2^i px. It gets the PSF energy in the ring [BLOOM_B[i-1], BLOOM_B[i])
+// px. Level 0 is the unblurred image, the last level takes the rest. The boundaries are the geometric
+// means of the levels' measured half-energy radii.
+const BLOOM_MAX = 9;
+// Measured (headless, 1024^2, one-hot weights, averaged over 5 sub-texel positions): r50 = 2.59 px at
+// level 1, 1.49 * 2^i px from level 2 on. Level 0 (one pixel) counts as 0.5 px.
+const BLOOM_B = [1.14, 3.84, 8.16, 16.6, 33.6, 67.2, 134, 269, 538];
+// Weights w[0..n] (sum 1) for n levels at pxDeg degrees per pixel (strength 1 = the eye's PSF).
+function bloomWeights(n, pxDeg) {
+  const w = [];
+  let prev = 0;
+  for (let i = 0; i <= n; i++) {
+    const c = i < n ? glareEE(BLOOM_B[i] * pxDeg) : 1;
+    w.push(c - prev); prev = c;
+  }
+  let s = 0;
+  for (let i = 1; i <= n; i++) s += w[i];
+  w[0] = 1 - s;
+  return w;
+}
+
+const bloom = { w: 0, h: 0, lv: [] };
+function bloomTarget(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fbo, w, h, free() { gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); } };
+}
+function ensureBloom(w, h) {
+  if (bloom.w === w && bloom.h === h) return;
+  bloom.lv.forEach(t => t.free());
+  bloom.lv = []; bloom.w = w; bloom.h = h;
+  let lw = w, lh = h;
+  for (let i = 1; i <= BLOOM_MAX; i++) {
+    lw = lw >> 1; lh = lh >> 1;
+    if (Math.min(lw, lh) < 2) break;
+    bloom.lv.push(bloomTarget(lw, lh));
+  }
+}
+// Runs the chain on src (w x h). Returns what the tonemap pass needs to composite the result.
+function drawBloom(src, w, h, pxDeg) {
+  ensureBloom(w, h);
+  const n = bloom.lv.length;
+  const wt = bloomWeights(n, pxDeg);
+  const S = []; S[n + 1] = 0;
+  for (let i = n; i >= 0; i--) S[i] = S[i + 1] + (wt[i] || 0);
+  const rho = (j) => S[j] > 0 ? S[j + 1] / S[j] : 0;
+  if (n === 0 || S[1] <= 0) return { tex: null, texel: [0, 0], mix: 0 };
+  gl.bindVertexArray(vaoEmpty);
+  // down: level i (bloom.lv[i - 1]) from level i - 1
+  gl.disable(gl.BLEND);
+  gl.useProgram(progDown.p);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1i(progDown.loc.uSrc, 0);
+  let s = src, sw = w, sh = h;
+  for (let i = 1; i <= n; i++) {
+    const L = bloom.lv[i - 1];
+    gl.bindTexture(gl.TEXTURE_2D, s);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, L.fbo); gl.viewport(0, 0, L.w, L.h);
+    gl.uniform2f(progDown.loc.uSrcTexel, 1 / sw, 1 / sh);
+    gl.uniform2f(progDown.loc.uDstInv, 1 / L.w, 1 / L.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    s = L.tex; sw = L.w; sh = L.h;
+  }
+  // up: A_j = (1 - rho_j) D_j + rho_j tent(A_{j+1}), in place, j = n - 1 .. 1
+  gl.useProgram(progUp.p);
+  gl.uniform1i(progUp.loc.uSrc, 0);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
+  for (let j = n - 1; j >= 1; j--) {
+    const D = bloom.lv[j - 1], A = bloom.lv[j];
+    gl.bindTexture(gl.TEXTURE_2D, A.tex);
+    gl.blendColor(0, 0, 0, rho(j));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, D.fbo); gl.viewport(0, 0, D.w, D.h);
+    gl.uniform2f(progUp.loc.uSrcTexel, 1 / A.w, 1 / A.h);
+    gl.uniform2f(progUp.loc.uDstInv, 1 / D.w, 1 / D.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  gl.disable(gl.BLEND);
+  const L1 = bloom.lv[0];
+  return { tex: L1.tex, texel: [1 / L1.w, 1 / L1.h], mix: rho(0) };
+}
+// P.fov applies to the shorter screen axis: vertical in landscape, horizontal in portrait (so a phone
+// held upright still sees the disk beside the shadow close in). tan(half the vertical fov), for w x h:
+const halfTanV = (w, h) => Math.tan(P.fov * PI / 360) * Math.max(1, h / w);
+// Degrees per pixel at the image centre.
+const pxDegFor = (w, h) => 2 * halfTanV(w, h) / h * 180 / PI;
+
+// Stars
+const vaoEmpty = gl.createVertexArray();
+
+// Milky Way cubemap: 6 faces of N^2 RGBA16F + full mip chain, baked once from milkyWay() at unit
+// brightness (the brightness slider scales it at lookup, so it never needs a rebake).
+function bakeSky(N) {
+  const texSky = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, texSky);
+  gl.texStorage2D(gl.TEXTURE_CUBE_MAP, Math.log2(N) + 1, gl.RGBA16F, N, N);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.viewport(0, 0, N, N);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progSkyBake.p);
+  gl.uniform1f(progSkyBake.loc.uN, N);
+  gl.bindVertexArray(vaoEmpty);
+  for (let face = 0; face < 6; face++) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, texSky, 0);
+    gl.uniform1i(progSkyBake.loc.uFace, face);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+  if (extAniso) gl.texParameterf(gl.TEXTURE_CUBE_MAP, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, ANISO_MAX));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fb);
+  return texSky;
+}
+const texSky = bakeSky(SKY_N);
+
+const vaoStars = gl.createVertexArray();
+const vboStars = gl.createBuffer();
+let starCount = 0, starKey = '';
+function uploadStars(n, seed, magMax) {
+  const data = genStars(n, seed, magMax);
+  starCount = n;
+  gl.bindVertexArray(vaoStars);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboStars);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 20, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 20, 12);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 20, 16);
+  gl.bindVertexArray(null);
+}
+
+// ============================================================ params + GUI
+// Values without a GUI control are fixed, but stay in P so that scripts (BH.P) can still set them.
+const VIEW0 = { dist: 40, elev: 8, azim: 0, fov: 60, lookYaw: 0, lookPitch: 0 };
+const P = {
+  ...VIEW0, orbitSpeed: 0,
+  disk: true, rIn: 6, rOut: 24, tDisk: 5500, opacity: 2.5, timeScale: 15, flowT: 60,
+  sky: 'milky way', milky: 0.4,
+  ringAA: true,
+  stars: true, starCount: 40000, starMagMax: 9, starGain: 120, starSize: 5, starSigma: 0.8, muMax: 200, starImages: 4,
+  exposureEV: -2.5, autoExposure: true, bloom: true, resScale: 'auto',
+};
+const P_DEFAULT = { ...P };   // the video tour starts from these, not from the user's settings
+const DIST_MIN = 2.0001, DIST_MAX = 1000;
+// Distance steps are multiplicative in R - 2, so the approach to the horizon is as smooth as far out.
+const clampDist = (R) => Math.max(DIST_MIN, Math.min(DIST_MAX, R));
+const zoomDist = (k) => { P.dist = clampDist(2 + (P.dist - 2) * Math.exp(k)); };
+// Render pixels per CSS pixel. auto: up to 1.5 on high-DPI screens, which keeps phones and 4K
+// laptops fast; 100%: every device pixel.
+function renderScale() {
+  const dpr = window.devicePixelRatio || 1;
+  return P.resScale === '50%' ? 0.5 * dpr : P.resScale === '100%' ? dpr : Math.min(dpr, 1.5);
+}
+
+const gui = new lil.GUI({ title: 'black hole' });
+const fs = gui.addFolder('Settings');
+fs.add(P, 'lookYaw', -180, 180, 0.5).name('look yaw').listen();
+fs.add(P, 'orbitSpeed', -30, 30, 0.5).name('auto orbit (deg/s)');
+fs.add(P, 'sky', ['milky way', 'grid', 'off']);
+fs.add(P, 'disk').name('show disk');
+fs.add(P, 'stars').name('show stars');
+fs.add(P, 'starCount', 0, 300000, 1000).name('star count');
+fs.add({ f: resetView }, 'f').name('reset view');
+fs.add({ f: () => window.open(REPO_URL, '_blank', 'noopener') }, 'f').name('source on GitHub ↗');
+const fa = gui.addFolder('Advanced').close();
+fa.add(P, 'resScale', ['auto', '50%', '100%']).name('resolution');
+fa.add(P, 'bloom').name('glare');
+fa.add(P, 'ringAA').name('ring anti-aliasing');
+fa.add(P, 'exposureEV', -10, 10, 0.1).name('exposure (EV)');
+fa.add(P, 'milky', 0, 3, 0.01).name('milky way brightness');
+fa.add(P, 'autoExposure').name('blueshift auto exposure');
+fa.add(P, 'rIn', 3.2, 20, 0.1).name('disk inner r (ISCO = 6)');
+fa.add(P, 'rOut', 7, 100, 0.5).name('disk outer r');
+fa.add(P, 'starSize', 1, 16, 1).name('star sprite px');
+fa.add(P, 'starSigma', 0.3, 3, 0.05).name('star sprite sigma');
+if (innerWidth < 600) gui.close();   // phones: start with the panel folded
+
+function resetView() { Object.assign(P, VIEW0); }
+let uiHidden = false;
+function toggleUI() {
+  uiHidden = !uiHidden;
+  gui.domElement.classList.toggle('hidden', uiHidden);
+  info.classList.toggle('hidden', uiHidden);
+}
+
+// Pointer: one-finger / mouse drag = orbit, two-finger pinch = distance, wheel = distance.
+const pointers = new Map();
+let pinchD = 0;
+const pinchDist = () => { const [a, b] = [...pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+canvas.addEventListener('pointerdown', e => {
+  tourStop();   // touching the view hands the camera back
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.setPointerCapture(e.pointerId);
+  if (pointers.size === 2) pinchD = pinchDist();
+});
+const pointerEnd = e => { pointers.delete(e.pointerId); if (pointers.size === 2) pinchD = pinchDist(); };
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
+canvas.addEventListener('pointermove', e => {
+  const pt = pointers.get(e.pointerId);
+  if (!pt) return;
+  const dx = e.clientX - pt.x, dy = e.clientY - pt.y;
+  pt.x = e.clientX; pt.y = e.clientY;
+  if (pointers.size === 1) {
+    const s = 0.25 * P.fov / 60;
+    P.azim -= dx * s;
+    P.elev = Math.max(-89, Math.min(89, P.elev + dy * s));
+    P.azim = ((P.azim + 180) % 360 + 360) % 360 - 180;
+  } else if (pointers.size === 2) {
+    const d = pinchDist();
+    if (pinchD > 0 && d > 0) zoomDist(Math.log(pinchD / d));   // spread fingers = closer
+    pinchD = d;
+  }
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  tourStop();
+  zoomDist(e.deltaY * 0.001);
+}, { passive: false });
+
+// Keyboard (held keys, applied per frame): W/S or Up/Down or +/- = distance, A/D or Left/Right =
+// orbit, Q/E or PageUp/PageDown = elevation. Shift = 4x faster. H = hide UI.
+const keys = new Set();
+const KEYMAP = {
+  KeyW: 'in', ArrowUp: 'in', Equal: 'in', NumpadAdd: 'in',
+  KeyS: 'out', ArrowDown: 'out', Minus: 'out', NumpadSubtract: 'out',
+  KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
+  KeyQ: 'down', PageDown: 'down', KeyE: 'up', PageUp: 'up',
+};
+let shiftHeld = false;
+window.addEventListener('keydown', e => {
+  shiftHeld = e.shiftKey;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (e.code === 'KeyH' && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) { toggleUI(); return; }
+  if (e.code === 'Space' && TOUR_EDIT) { if (!e.repeat) tourPlayPause(); e.preventDefault(); return; }
+  const a = KEYMAP[e.code];
+  if (!a) return;
+  tourStop();
+  keys.add(a); e.preventDefault();
+});
+window.addEventListener('keyup', e => { shiftHeld = e.shiftKey; const a = KEYMAP[e.code]; if (a) keys.delete(a); });
+window.addEventListener('blur', () => keys.clear());
+
+function applyKeys(dt) {
+  if (!keys.size) return;
+  const s = (shiftHeld ? 4 : 1) * dt;
+  const zoom = (keys.has('out') ? 1 : 0) - (keys.has('in') ? 1 : 0);
+  if (zoom) zoomDist(zoom * 0.8 * s);
+  const turn = (keys.has('right') ? 1 : 0) - (keys.has('left') ? 1 : 0);
+  if (turn) P.azim = ((P.azim + turn * 45 * s + 180) % 360 + 360) % 360 - 180;
+  const tilt = (keys.has('up') ? 1 : 0) - (keys.has('down') ? 1 : 0);
+  if (tilt) P.elev = Math.max(-89, Math.min(89, P.elev + tilt * 30 * s));
+}
+
+// ============================================================ frame
+let builtR = -1, simTime = 0, lastT = performance.now(), fps = 0, frames = 0, fpsT = lastT, paused = false;
+
+function camera() {
+  const el = P.elev * PI / 180, az = P.azim * PI / 180;
+  const e1 = [Math.cos(el) * Math.cos(az), Math.cos(el) * Math.sin(az), Math.sin(el)];
+  const C = e1.map(v => v * P.dist);
+  const f0 = e1.map(v => -v);
+  const r0 = norm3(cross3(f0, [0, 0, 1]));
+  const u0 = cross3(r0, f0);
+  const y = P.lookYaw * PI / 180, p = P.lookPitch * PI / 180;
+  const F = norm3([0, 1, 2].map(k => f0[k] * Math.cos(y) * Math.cos(p) + r0[k] * Math.sin(y) * Math.cos(p) + u0[k] * Math.sin(p)));
+  const Rt = norm3(cross3(F, u0));
+  const U = cross3(Rt, F);
+  const perp = norm3(cross3(e1, Math.abs(e1[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0]));
+  return { C, F, Rt, U, perp };
+}
+
+function setCommon(prog, cam, w, h) {
+  const L = prog.loc, R = tables.R, thc = tables.thc;
+  gl.uniform1i(L.uTabU, 0); gl.uniform1i(L.uTabEnd, 1); gl.uniform1i(L.uInv, 2); gl.uniform1i(L.uBB, 3);
+  gl.uniform3fv(L.uCam, cam.C); gl.uniform3fv(L.uCamR, cam.Rt); gl.uniform3fv(L.uCamU, cam.U);
+  gl.uniform3fv(L.uCamF, cam.F); gl.uniform3fv(L.uPerp, cam.perp);
+  gl.uniform2f(L.uRes, w, h);
+  gl.uniform1f(L.uFocal, 1 / halfTanV(w, h));
+  gl.uniform1f(L.uR, R);
+  gl.uniform1f(L.uGcam, 1 / Math.sqrt(1 - 2 / R));
+  gl.uniform1f(L.uThc, thc);
+  gl.uniform1f(L.uLogThc, Math.log(thc));
+  gl.uniform1f(L.uLogPmc, Math.log(PI - thc));
+  gl.uniform1f(L.uDiskOn, P.disk ? 1 : 0);
+  const rIn = P.rIn, rOut = Math.max(P.rOut, rIn + 0.5);
+  gl.uniform1f(L.uRin, rIn); gl.uniform1f(L.uRout, rOut);
+  gl.uniform1f(L.uTdisk, P.tDisk);
+  const rp = rIn * 49 / 36;                    // peak of (1 - sqrt(rIn/r)) / r^3
+  gl.uniform1f(L.uTnorm, (1 - Math.sqrt(rIn / rp)) / (rp * rp * rp));
+  gl.uniform1f(L.uOpacity, P.opacity);
+  gl.uniform1f(L.uTime, simTime);
+  gl.uniform1f(L.uFlowT, P.flowT);
+}
+
+const SKY_MODES = { 'milky way': 0, grid: 1, off: 2 };
+function bindTables() {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texU);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texEnd);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texInv);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texBB);
+}
+// Scene pass: disk + lensed sky.
+function drawScene(fbo, w, h, cam) {
+  bindTables();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progScene.p);
+  setCommon(progScene, cam, w, h);
+  const L = progScene.loc;
+  gl.uniform1f(L.uSkyMode, SKY_MODES[P.sky]);
+  gl.uniform3fv(L.uMilky, skyShift().map(v => v * P.milky));
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_CUBE_MAP, texSky);
+  gl.uniform1i(L.uSky, 4);
+  gl.uniform1f(L.uAA, P.ringAA ? 1 : 0);
+  gl.bindVertexArray(vaoEmpty);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+// Forward-mapped stars, additive, scaled by the target's alpha (the disk's transmittance, written by
+// the scene pass); the target's alpha is left unchanged. pxScale: sprite size multiplier (render px per CSS px).
+function drawStars(fbo, w, h, cam, pxScale) {
+  bindTables();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, w, h);
+  gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.DST_ALPHA, gl.ONE, gl.ZERO, gl.ONE);
+  gl.useProgram(progStars.p);
+  setCommon(progStars, cam, w, h);
+  const L = progStars.loc;
+  gl.uniform1f(L.uInvMax, tables.invMax);
+  gl.uniform1f(L.uMuMax, P.muMax);
+  gl.uniform1f(L.uStarGain, P.starGain);
+  gl.uniform1f(L.uStarSize, Math.max(1, Math.round(P.starSize * pxScale)));
+  gl.uniform1f(L.uStarSigma, P.starSigma * pxScale);
+  gl.bindVertexArray(vaoStars);
+  gl.drawArraysInstanced(gl.POINTS, 0, starCount, P.starImages);
+  gl.disable(gl.BLEND);
+}
+// bl: result of drawBloom (or null).
+function drawTone(fbo, src, w, h, bl) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progTone.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bl && bl.tex ? bl.tex : src);
+  gl.uniform1i(progTone.loc.uHdr, 0);
+  gl.uniform1i(progTone.loc.uBloom, 1);
+  gl.uniform1f(progTone.loc.uBloomMix, bl && bl.tex ? bl.mix : 0);
+  gl.uniform2fv(progTone.loc.uBloomTexel, bl ? bl.texel : [0, 0]);
+  gl.uniform2f(progTone.loc.uRes, w, h);
+  gl.uniform1f(progTone.loc.uExposure, Math.pow(2, P.exposureEV) / bbLum(P.tDisk * autoExpG()));
+  gl.bindVertexArray(vaoEmpty);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function syncTables() { if (P.dist !== builtR) { rebuild(P.dist); builtR = P.dist; } }
+function syncStars() {
+  const key = P.starCount + '/' + P.starMagMax;
+  if (key !== starKey) { uploadStars(P.starCount, 12345, P.starMagMax); starKey = key; }
+}
+
+// One frame at the current P and simTime into the canvas, resized to w x h render pixels.
+function render(w, h, pxScale) {
+  syncTables();
+  syncStars();
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  ensureTarget(w, h);
+  const cam = camera();
+  drawScene(hdrFbo, w, h, cam);
+  if (P.stars && P.sky !== 'off' && starCount > 0) drawStars(hdrFbo, w, h, cam, pxScale);
+  const bl = P.bloom ? drawBloom(hdrTex, w, h, pxDegFor(w, h)) : null;
+  drawTone(null, hdrTex, w, h, bl);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  if (paused) return;
+  if (tourOn) tourTick(dt);
+  else {
+    simTime += dt * P.timeScale;
+    applyKeys(dt);
+    if (P.orbitSpeed) P.azim = ((P.azim + P.orbitSpeed * dt + 180) % 360 + 360) % 360 - 180;
+  }
+  const s = renderScale();
+  render(Math.max(1, Math.round(canvas.clientWidth * s)), Math.max(1, Math.round(canvas.clientHeight * s)), s);
+
+  frames++;
+  if (now - fpsT > 500) { fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now; }
+  info.textContent = `${fps.toFixed(0)} fps   R = ${fmtR(P.dist)} M\n` + tourInfo() + HELP;
+}
+const HELP = matchMedia('(pointer: coarse)').matches ? 'drag: orbit   pinch: distance'
+  : 'drag / A D: orbit   Q E: elevation   wheel / W S: distance   shift: faster   H: hide UI';
+
+// Luminance of the blackbody table at T (CPU side, for exposure normalisation).
+const BBDATA = buildBB();
+function bbLum(T) {
+  const x = (Math.log(T) - Math.log(BB_T0)) / (Math.log(BB_T1) - Math.log(BB_T0)) * (NBB - 1);
+  const k = Math.max(0, Math.min(NBB - 2, Math.floor(x))), fr = x - k;
+  return Math.max(1e-6, BBDATA[k * 4 + 3] * (1 - fr) + BBDATA[(k + 1) * 4 + 3] * fr);
+}
+// Blackbody rgba at T, as bb() in the shaders (Rayleigh-Jeans tail above BB_T1).
+function bbAt(T) {
+  const x = (Math.log(T) - Math.log(BB_T0)) / (Math.log(BB_T1) - Math.log(BB_T0)) * (NBB - 1);
+  if (x >= NBB - 1) return [0, 1, 2, 3].map(c => BBDATA[(NBB - 1) * 4 + c] * T / BB_T1);
+  const k = Math.max(0, Math.floor(x)), fr = Math.max(0, x - k);
+  return [0, 1, 2, 3].map(c => BBDATA[k * 4 + c] * (1 - fr) + BBDATA[(k + 1) * 4 + c] * fr);
+}
+
+// Camera blueshift. A static observer at R sees all incoming light blueshifted by
+// g = 1/sqrt(1 - 2/R) (3.3x at R 2.2, 45x at 2.001); the disk and stars already include it (uGcam).
+const camG = () => 1 / Math.sqrt(1 - 2 / tables.R);
+// Auto exposure: normalise to the peak disk temperature as this camera sees it. Only the brightness
+// change is compensated, so the colour shift stays visible.
+const autoExpG = () => P.autoExposure ? camG() : 1;
+// The Milky Way is an RGB texture, not a spectrum: shift it as if it were a 5000 K blackbody (roughly
+// the integrated light of old disk stars), per channel.
+const SKY_T = 5000;
+function skyShift() {
+  const g = camG();
+  if (g === 1) return [1, 1, 1];
+  const a = bbAt(SKY_T * g), b = bbAt(SKY_T);
+  return [0, 1, 2].map(c => a[c] / b[c]);
+}
+const fmtR = (R) => R - 2 < 0.1 ? R.toFixed(5) : R.toFixed(2);
+
+// ============================================================ video tour
+// The timeline is in tour.js (var TOUR; the format is explained there). compileTour()
+// checks it and turns each scene's keys into one track per value; tourState(T) gives the P values
+// at tour time T (seconds). Nothing here depends on wall-clock time, so an offline renderer can
+// evaluate any frame exactly (BH.tourAt). Open with ?edit to add an editor panel and reload the
+// tour file every second.
+const TOUR_EDIT = /[?&#]edit\b/.test(location.search + location.hash);
+const TOUR_T0 = 100;           // disk time (simTime) at the start of the tour
+const TOUR_DT = 1 / 120;       // step of the disk-time integral
+const CAM_KEYS = Object.keys(VIEW0);
+const EASE = { smooth: f => f * f * (3 - 2 * f), linear: f => f, in: f => f * f, out: f => f * (2 - f) };
+// Values interpolated in a warped space so the motion looks even: [forward, inverse].
+const WARP = {
+  dist: [R => Math.log(Math.max(1e-9, R - 2)), x => 2 + Math.exp(x)],                  // like the wheel
+  fov: [f => Math.log(Math.tan(Math.max(0.1, Math.min(179, f)) * PI / 360)), x => Math.atan(Math.exp(x)) * 360 / PI],  // even zoom
+};
+const wrap180 = a => ((a + 180) % 360 + 360) % 360 - 180;
+
+function compileTour(src) {
+  const errors = [], scenes = [], used = new Set(CAM_KEYS);
+  if (!Array.isArray(src)) errors.push(src === undefined ? 'tour.js is missing or has an error: see the browser console (F12)' : 'TOUR should be a list [ ... ]');
+  let start = 0, state = { ...P_DEFAULT };
+  (Array.isArray(src) ? src : []).forEach((sc, i) => {
+    const label = `scene ${i + 1}` + (sc && sc.name ? ` '${sc.name}'` : '');
+    if (!sc || typeof sc !== 'object') return errors.push(`${label}: should be { ... }`);
+    for (const k of Object.keys(sc)) if (!['name', 'length', 'keys'].includes(k)) errors.push(`${label}: unknown field '${k}'`);
+    const len = sc.length;
+    if (!(typeof len === 'number' && len > 0)) return errors.push(`${label}: length should be a number > 0`);
+    if (!Array.isArray(sc.keys)) errors.push(`${label}: keys should be a list [ ... ]`);
+    const tracks = {};
+    (Array.isArray(sc.keys) ? sc.keys : []).forEach((key, j) => {
+      const kl = `${label}, key ${j + 1}`;
+      if (!key || typeof key.t !== 'number') return errors.push(`${kl}: t is missing`);
+      if (key.t < 0 || key.t > len) errors.push(`${kl}: t ${key.t} is outside the scene (0 to ${len})`);
+      const ease = EASE[key.ease || 'smooth'];
+      if (!ease) errors.push(`${kl}: unknown ease '${key.ease}' (smooth, linear, in, out)`);
+      for (const [p, v] of Object.entries(key)) {
+        if (p === 't' || p === 'ease') continue;
+        if (!(p in P_DEFAULT)) { errors.push(`${kl}: unknown value '${p}'`); continue; }
+        const type = typeof P_DEFAULT[p];
+        if (typeof v !== type || (type === 'number' && !isFinite(v))) { errors.push(`${kl}: ${p} should be a ${type === 'boolean' ? 'true / false' : type}`); continue; }
+        if (p === 'sky' && !(v in SKY_MODES)) { errors.push(`${kl}: sky should be 'milky way', 'grid' or 'off'`); continue; }
+        if (p === 'dist' && v <= 2) { errors.push(`${kl}: dist should be more than 2 (the horizon)`); continue; }
+        used.add(p);
+        (tracks[p] = tracks[p] || []).push({ t: Math.max(0, Math.min(len, key.t)), v, ease: ease || EASE.smooth });
+      }
+    });
+    for (const tr of Object.values(tracks)) tr.sort((a, b) => a.t - b.t);   // stable: equal t keep file order
+    const scene = { name: sc.name || `scene ${i + 1}`, start, len, tracks, from: state };
+    scenes.push(scene);
+    state = sceneState(scene, len);
+    start += len;
+  });
+  const tour = { scenes, total: start, used, errors };
+  // Disk time = TOUR_T0 + integral of timeScale over tour time, tabulated (trapezoid rule).
+  const n = Math.ceil(start / TOUR_DT) + 2;
+  tour.simT = new Float64Array(n);
+  tour.simT[0] = TOUR_T0;
+  let prev = tourState(tour, 0).timeScale;
+  for (let k = 1; k < n; k++) {
+    const ts = tourState(tour, k * TOUR_DT).timeScale;
+    tour.simT[k] = tour.simT[k - 1] + 0.5 * (prev + ts) * TOUR_DT;
+    prev = ts;
+  }
+  return tour;
+}
+// Value of one track at scene time u. v0: the value when the scene starts.
+function trackValue(p, tr, u, v0) {
+  let pt = 0, pv = v0;
+  for (const k of tr) {
+    if (u < k.t) {
+      if (typeof k.v !== 'number') return pv;               // on/off and choices switch at the key
+      const f = k.ease((u - pt) / (k.t - pt)), w = WARP[p];
+      if (!w) return pv + (k.v - pv) * f;
+      const a = w[0](pv), b = w[0](k.v);
+      return w[1](a + (b - a) * f);
+    }
+    pt = k.t; pv = k.v;
+  }
+  return pv;
+}
+function sceneState(sc, u) {
+  const s = { ...sc.from };
+  for (const p in sc.tracks) s[p] = trackValue(p, sc.tracks[p], u, sc.from[p]);
+  return s;
+}
+function sceneIndex(tour, T) {
+  let i = tour.scenes.length - 1;
+  while (i > 0 && T < tour.scenes[i].start) i--;
+  return i;
+}
+function tourState(tour, T) {
+  if (!tour.scenes.length) return { ...P_DEFAULT };
+  const sc = tour.scenes[sceneIndex(tour, T)];
+  return sceneState(sc, Math.max(0, Math.min(sc.len, T - sc.start)));
+}
+function tourSimTime(tour, T) {
+  const x = Math.max(0, Math.min(tour.total, T)) / TOUR_DT, k = Math.min(Math.floor(x), tour.simT.length - 2);
+  return tour.simT[k] + (tour.simT[k + 1] - tour.simT[k]) * (x - k);
+}
+// Sets P (only the values the tour uses, plus the camera) and the disk time for tour time T.
+function applyTour(T) {
+  const s = tourState(tour, T);
+  for (const p of tour.used) P[p] = s[p];
+  P.dist = clampDist(P.dist);
+  P.elev = Math.max(-89, Math.min(89, P.elev));
+  P.azim = wrap180(P.azim);
+  P.lookYaw = wrap180(P.lookYaw);
+  simTime = tourSimTime(tour, T);
+}
+
+// ---- player
+let tour = compileTour(window.TOUR), tourSrc = JSON.stringify(window.TOUR);
+let tourOn = false, tourPlaying = false, tourT = 0, tourSaved = null, tourFlash = '', tourFlashT = 0;
+const tourUI = { time: 0, scene: 0, speed: 1, loop: false, frame: '16:9', autoReload: true };
+if (TOUR_EDIT) tour.errors.forEach(e => console.warn('tour: ' + e));
+
+function tourStart(T) {
+  if (!tourOn) { tourSaved = { ...P }; tourOn = true; }
+  if (T !== undefined) tourT = T;
+}
+// Hands the camera back to the user. The public tour also puts the user's other settings back.
+function tourStop() {
+  if (!tourOn) return;
+  tourOn = tourPlaying = false;
+  if (!TOUR_EDIT) for (const p of tour.used) if (!CAM_KEYS.includes(p)) P[p] = tourSaved[p];
+  refreshTourGui();
+}
+function tourPlayPause() {
+  if (tourPlaying) { tourPlaying = false; return; }
+  if (tourT >= tour.total) tourT = 0;
+  tourStart();
+  tourPlaying = true;
+}
+function tourTick(dt) {
+  if (tourPlaying) {
+    tourT += dt * tourUI.speed;
+    if (tourT >= tour.total) {
+      if (tourUI.loop || !TOUR_EDIT) tourT = tour.total > 0 ? tourT % tour.total : 0;
+      else { tourT = tour.total; tourPlaying = false; }
+    }
+  }
+  applyTour(tourT);
+  refreshTourGui();
+}
+function flash(msg) { tourFlash = msg; tourFlashT = performance.now(); }
+// Extra status text lines (they end with \n).
+function tourInfo() {
+  let s = '';
+  if (!TOUR_EDIT) return tourOn ? `video tour ${tourT.toFixed(0)} / ${tour.total.toFixed(0)} s   (drag or a key: stop)\n` : '';
+  const i = sceneIndex(tour, tourT), sc = tour.scenes[i];
+  s += `tour ${tourT.toFixed(2)} / ${tour.total.toFixed(1)} s` + (sc ? `   scene ${i + 1} '${sc.name}' ${(tourT - sc.start).toFixed(2)} / ${sc.len} s` : '')
+     + (!tourOn ? '   (free camera)' : tourPlaying ? '' : '   (paused)') + '   space: play/pause\n';
+  for (const e of tour.errors.slice(0, 10)) s += '! ' + e + '\n';
+  if (tour.errors.length > 10) s += `! ... ${tour.errors.length - 10} more, see the console\n`;
+  if (tourFlash && performance.now() - tourFlashT < 4000) s += tourFlash + '\n';
+  return s;
+}
+
+// ---- GUI: 'video tour' in Advanced; with ?edit, a 'tour editor' folder.
+// The buttons drop focus, because lil-gui keeps key presses inside the panel (keys stop the tour,
+// space plays/pauses).
+const unfocus = () => document.activeElement && document.activeElement.blur();
+const btnTour = fa.add({ f: () => { unfocus(); if (tourOn) tourStop(); else { tourStart(0); tourPlaying = true; } } }, 'f').name('video tour');
+if (!Array.isArray(window.TOUR)) btnTour.hide();
+let ctlTime = null, ctlScene = null, btnPlay = null;
+const sceneOptions = () => Object.fromEntries(tour.scenes.map((sc, i) => [`${i + 1} ${sc.name}`, i]));
+function makeSceneCtl() {
+  ctlScene = ctlScene.options(sceneOptions()).name('scene').listen()
+    .onChange(i => { if (tour.scenes[i]) tourStart(tour.scenes[i].start); });
+}
+function refreshTourGui() {
+  btnTour.name(tourOn && !TOUR_EDIT ? 'stop video tour' : 'video tour');
+  if (tourOn) for (const c of gui.controllersRecursive()) if (c !== ctlTime && c !== ctlScene) c.updateDisplay();
+  if (!TOUR_EDIT) return;
+  tourUI.time = tourT;
+  tourUI.scene = sceneIndex(tour, tourT);
+  btnPlay.name(tourPlaying ? 'pause' : 'play');
+}
+if (TOUR_EDIT) {
+  fs.close();
+  const ft = gui.addFolder('tour editor');
+  btnPlay = ft.add({ f: () => { unfocus(); tourPlayPause(); } }, 'f').name('play');
+  ctlTime = ft.add(tourUI, 'time', 0, Math.max(0.01, tour.total), 0.01).name('time (s)').listen()
+    .onChange(v => { tourStart(v); tourPlaying = false; });
+  ctlScene = ft.add(tourUI, 'scene', [0]);
+  makeSceneCtl();
+  ft.add(tourUI, 'speed', [0.25, 0.5, 1, 2]);
+  ft.add(tourUI, 'loop');
+  ft.add(tourUI, 'frame', ['window', '16:9']).name('preview frame').onChange(layoutCanvas);
+  ft.add({ f: tourStop }, 'f').name('stop (free camera)');
+  ft.add({ f: copyCamera }, 'f').name('copy camera');
+  // Free-camera controls the main panel doesn't have. Moving one hands the camera back.
+  for (const [k, lo, hi, st] of [['dist', 2.001, 100, 0.001], ['elev', -89, 89, 0.5], ['azim', -180, 180, 0.5], ['fov', 1, 120, 0.5], ['lookPitch', -90, 90, 0.5]])
+    ft.add(P, k, lo, hi, st).listen().onChange(tourStop);
+  ft.add(tourUI, 'autoReload').name('auto reload tour file');
+  setInterval(() => { if (tourUI.autoReload) reloadTour(); }, 1000);
+}
+refreshTourGui();
+
+// The video's 16:9 frame inside the window, so the preview shows what the video will.
+function layoutCanvas() {
+  const st = canvas.style;
+  if (TOUR_EDIT && tourUI.frame === '16:9') {
+    const w = Math.floor(Math.min(innerWidth, innerHeight * 16 / 9)), h = Math.floor(w * 9 / 16);
+    st.width = w + 'px'; st.height = h + 'px';
+    st.margin = `${Math.floor((innerHeight - h) / 2)}px auto 0`; st.outline = '1px solid #333';
+  } else st.width = st.height = st.margin = st.outline = '';
+}
+addEventListener('resize', layoutCanvas);
+layoutCanvas();
+
+// A key for the current view, with t relative to the scene the tour was last at.
+function copyCamera() {
+  const i = sceneIndex(tour, tourT), sc = tour.scenes[i];
+  const r = (x, n) => +x.toFixed(n);
+  const line = `{ t: ${sc ? r(tourT - sc.start, 1) : 0}, dist: ${r(P.dist, P.dist - 2 < 0.1 ? 5 : 2)}, elev: ${r(P.elev, 1)}, `
+    + `azim: ${r(P.azim, 1)}, fov: ${r(P.fov, 1)}, lookYaw: ${r(P.lookYaw, 1)}, lookPitch: ${r(P.lookPitch, 1)} },`
+    + (sc ? `   // scene ${i + 1} '${sc.name}'` : '');
+  console.log(line);
+  const fallback = () => window.prompt('Copy this key:', line);
+  if (navigator.clipboard) navigator.clipboard.writeText(line).then(() => flash('copied: ' + line), fallback);
+  else fallback();
+}
+
+// Reloads tour.js (classic script tag, so it works from file://). Applies it if it changed.
+let tourLoading = false, tourFileOk = true;
+function reloadTour() {
+  if (tourLoading) return;
+  tourLoading = true;
+  window.TOUR = undefined;
+  const el = document.createElement('script');
+  el.src = 'tour.js?' + Date.now();
+  el.onload = el.onerror = () => {
+    el.remove();
+    tourLoading = false;
+    const ok = window.TOUR !== undefined;
+    if (!ok) {   // syntax error or missing file: keep the last good tour
+      if (tourFileOk) { tour.errors = ['tour.js has an error: see the browser console (F12). Playing the last good version.']; tourSrc = ''; }
+      tourFileOk = false;
+      return;
+    }
+    tourFileOk = true;
+    const src = JSON.stringify(window.TOUR);
+    if (src === tourSrc) return;
+    tourSrc = src;
+    tour = compileTour(window.TOUR);
+    tour.errors.forEach(e => console.warn('tour: ' + e));
+    tourT = Math.min(tourT, tour.total);
+    ctlTime.max(Math.max(0.01, tour.total));
+    makeSceneCtl();
+    btnTour.show(Array.isArray(window.TOUR));
+    if (tourOn) applyTour(tourT);
+    flash(tour.errors.length ? 'tour reloaded, with problems' : 'tour reloaded');
+  };
+  document.head.appendChild(el);
+}
+
+// Scripting hook, for screenshots/offline video frames:
+//   BH.pause(); BH.P.dist = 20; BH.setTime(0); BH.renderFrame(1920, 1080);
+// renderFrame() without a size renders at the window's size and render scale.
+window.BH = {
+  P,
+  setTime(t) { simTime = t; },
+  pause(on = true) { paused = on; },
+  renderFrame(w, h, pxScale = 1) {
+    if (w && h) render(w, h, pxScale);
+    else { const s = renderScale(); render(Math.max(1, Math.round(canvas.clientWidth * s)), Math.max(1, Math.round(canvas.clientHeight * s)), s); }
+  },
+  // Video tour: its length in seconds, and setting P + disk time for tour time T (for offline frames).
+  tourLength() { return tour.total; },
+  tourAt(T) { applyTour(T); },
+};
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
