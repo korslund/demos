@@ -1,3 +1,5 @@
 # Demos
 
-- ![](blackhole/thumb.png) [Black hole](blackhole/) – fast and physically accurate black hole renderer
+- [Black hole](korslund.github.io/demos/blackhole/) – fast and physically accurate black hole renderer
+
+![](blackhole/thumb.png)

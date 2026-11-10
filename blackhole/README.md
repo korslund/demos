@@ -3,6 +3,7 @@
 ## Demo
 
 [![Live demo](thumb.png)](https://korslund.github.io/demos/blackhole)
+
 [Live demo](https://korslund.github.io/demos/blackhole)
 
 ## Features
@@ -18,7 +19,8 @@
 
 ## Screenshots
 
-| | |
+|||
+|---|---|
 | ![](disk.png) | ![](lensing.png) |
 | ![](grid.png) | ![](reverse.png) |
 
