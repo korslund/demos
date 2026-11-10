@@ -27,7 +27,7 @@
 <script src="tour.js"></script>
 <script>
 'use strict';
-const REPO_URL = 'https://github.com/korslund/demos/blackhole';
+const REPO_URL = 'https://github.com/korslund/demos';
 // Schwarzschild black hole via precomputed geodesic tables.
 // - Camera-independent ("universal") tables: one table of orbits indexed by impact parameter, built
 //   once; per camera distance only a cheap 1D root find plus a GPU pass.
@@ -1061,7 +1061,7 @@ fs.add(P, 'disk').name('show disk');
 fs.add(P, 'stars').name('show stars');
 fs.add(P, 'starCount', 0, 300000, 1000).name('star count');
 fs.add({ f: resetView }, 'f').name('reset view');
-fs.add({ f: () => window.open(REPO_URL, '_blank', 'noopener') }, 'f').name('source on GitHub ↗');
+fs.add({ f: () => window.open(REPO_URL, '_blank', 'noopener') }, 'f').name('GitHub ↗');
 const fa = gui.addFolder('Advanced').close();
 fa.add(P, 'resScale', ['auto', '50%', '100%']).name('resolution');
 fa.add(P, 'bloom').name('glare');
