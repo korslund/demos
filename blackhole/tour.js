@@ -64,8 +64,8 @@ var TOUR = [
     name: 'close',
     length: 3,
     keys:[
-      { t: 0, disk:true, dist: 8.6, elev: 4, azim: 0, fov: 75, lookYaw: -63, lookPitch: 14.5 },
-      { t: 3, elev: 1, azim: 96, ease:'linear' },
+      { t: 0, disk:true, dist: 8.6, elev: 4, azim: -20, fov: 75, lookYaw: -63, lookPitch: 14.5 },
+      { t: 3, elev: 1, azim: 76, ease:'linear' },
       ],
   },
   {
@@ -81,7 +81,7 @@ var TOUR = [
     name: 'dive',
     length: 13.7,
     keys: [
-      { t: 0, disk:true, sky:'milky way', dist: 91.18, elev: 11.8, azim: -45.5, fov: 60, lookYaw: 0, lookPitch: 0 },
+      { t: 0, disk:true, sky:'milky way', dist: 91.18, elev: 31.8, azim: -45.5, fov: 60, lookYaw: 0, lookPitch: 0 },
       { t: 3.197, dist: 8, lookYaw: -50, ease:'linear'},
       { t: 5.389, dist: 2.3, lookYaw: -120, ease:'linear' },
       { t: 7.489, dist: 2.05, lookYaw: -170, ease:'linear'},
